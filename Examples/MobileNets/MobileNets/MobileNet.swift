@@ -7,223 +7,104 @@ import Forge
 /**
   The neural network from the paper "MobileNets: Efficient Convolutional Neural
   Networks for Mobile Vision Applications" https://arxiv.org/abs/1704.04861v1
-
-  **NOTE:** This is currently using random parameters; the network *hasn't been 
-  trained on anything yet*, so the predictions don't make any sense at all! 
-  I just wanted to see how fast/slow this network architecture is on iPhone.
 */
-public class MobileNet: NeuralNetwork {
-  var outputImage: [MPSImage] = []
+class MobileNet: NeuralNetwork {
+  typealias Prediction = (labelIndex: Int, probability: Float)
+
   let classes: Int
-
-  let relu: MPSCNNNeuronReLU
-  let lanczos: MPSImageLanczosScale
-  var layers: [Any] = []
-  let softmax: MPSCNNSoftMax
-
-  var imgDesc: [MPSImageDescriptor] = []
-  var layerImgDesc: [Int] = []
-  let outputImgDesc: MPSImageDescriptor
-
-  let channelFormat = MPSImageFeatureChannelFormat.float16
+  let model: Model
 
   /**
     Creates a new MobileNet object.
     
     - Parameters:
-      - alpha: Width multiplier, a value between (0, 1]. Default is 1.
-      - rho: Resolution multiplier, a value between (0, 1]. Default is 1.
+      - widthMultiplier: Shrinks the number of channels. This is a value in the
+        range (0, 1]. Default is 1, which starts the network with 32 channels.
+        (This hyperparameter is called "alpha" in the paper.)
+      - resolutionMultiplier: Shrink the spatial dimensions of the input image.
+        This is a value between (0, 1]. Default is 1, which resizes to 224x224
+        pixels. (The paper calls this hyperparameter "rho".)
       - shallow: Whether to exclude the group of 5 conv layers in the middle.
       - classes: The number of classes in the softmax.
   */
   public init(device: MTLDevice,
-              alpha: Float = 1,
-              rho: Float = 1,
+              widthMultiplier: Float = 1,
+              resolutionMultiplier: Float = 1,
               shallow: Bool = false,
               classes: Int = 1000,
               inflightBuffers: Int) {
 
     self.classes = classes
 
-    outputImgDesc = MPSImageDescriptor(channelFormat: channelFormat,
-                                       width: 1,
-                                       height: 1,
-                                       featureChannels: 1000)
-    for _ in 0..<inflightBuffers {
-      outputImage.append(MPSImage(device: device, imageDescriptor: outputImgDesc))
-    }
+    let relu = MPSCNNNeuronReLU(device: device, a: 0)
 
-    relu = MPSCNNNeuronReLU(device: device, a: 0)
-    lanczos = MPSImageLanczosScale(device: device)
-    softmax = MPSCNNSoftMax(device: device)
+    let channels = Int(32 * widthMultiplier)
+    let resolution = Int(224 * resolutionMultiplier)
 
-    weightsLoader = { name, count in ParameterLoaderRandom(count: count) }
-    biasLoader = { name, count in ParameterLoaderRandom(count: count) }
+    let input = Input()
 
-    addLayers(device: device, alpha: alpha, rho: rho, shallow: shallow, classes: classes)
-  }
-
-  func addLayers(device: MTLDevice, alpha: Float, rho: Float, shallow: Bool, classes: Int) {
-    var currentWidth = Int(224 * rho)
-    var currentHeight = Int(224 * rho)
-    var currentChannels = Int(32 * alpha)
-
-    func addImageDescriptor(_ desc: MPSImageDescriptor) {
-      print("\t\(desc.width) x \(desc.height) x \(desc.featureChannels)")
-      imgDesc.append(desc)
-    }
-
-    func useImageDescriptor() {
-      layerImgDesc.append(imgDesc.count - 1)
-    }
-
-    func addDepthwiseStride2(name: String) {
-      layers.append(depthwiseConvolution(device: device,
-                                         kernel: (3, 3),
-                                         channels: currentChannels,
-                                         name: name,
-                                         stride: (2, 2)))
-      currentWidth /= 2
-      currentHeight /= 2
-      addImageDescriptor(MPSImageDescriptor(channelFormat: channelFormat,
-                                            width: currentWidth,
-                                            height: currentHeight,
-                                            featureChannels: currentChannels))
-      useImageDescriptor()
-
-      layers.append(relu)
-      useImageDescriptor()
-    }
-
-    func addDepthwiseStride1(name: String) {
-      layers.append(depthwiseConvolution(device: device,
-                                         kernel: (3, 3),
-                                         channels: currentChannels,
-                                         name: name))
-      useImageDescriptor()
-
-      layers.append(relu)
-      useImageDescriptor()
-    }
-
-    func addPointwise(name: String) {
-      layers.append(pointwiseConvolution(device: device,
-                                         inChannels: currentChannels,
-                                         outChannels: currentChannels,
-                                         filter: relu, name: name))
-      useImageDescriptor()
-    }
-
-    func addPointwise2x(name: String) {
-      layers.append(pointwiseConvolution(device: device,
-                                         inChannels: currentChannels,
-                                         outChannels: currentChannels * 2,
-                                         filter: relu, name: name))
-      currentChannels *= 2
-      addImageDescriptor(MPSImageDescriptor(channelFormat: channelFormat,
-                                            width: currentWidth,
-                                            height: currentHeight,
-                                            featureChannels: currentChannels))
-      useImageDescriptor()
-    }
-
-    addImageDescriptor(MPSImageDescriptor(channelFormat: channelFormat,
-                                          width: currentWidth,
-                                          height: currentHeight,
-                                          featureChannels: 3))
-
-    layers.append(convolution(device: device,
-                              kernel: (3, 3),
-                              inChannels: 3,
-                              outChannels: currentChannels,
-                              filter: relu,
-                              name: "conv1_s2",
-                              stride: (2, 2)))
-    currentWidth /= 2
-    currentHeight /= 2
-
-    addImageDescriptor(MPSImageDescriptor(channelFormat: channelFormat,
-                                          width: currentWidth,
-                                          height: currentHeight,
-                                          featureChannels: currentChannels))
-    useImageDescriptor()
-
-    addDepthwiseStride1(name: "conv2_dw_s1")
-    addPointwise2x(name: "conv3_pw_s1")
-
-    addDepthwiseStride2(name: "conv4_dw_s2")
-    addPointwise2x(name: "conv5_pw_s1")
-
-    addDepthwiseStride1(name: "conv6_dw_s1")
-    addPointwise(name: "conv7_pw_s1")
-
-    addDepthwiseStride2(name: "conv8_dw_s2")
-    addPointwise2x(name: "conv9_pw_s1")
-
-    addDepthwiseStride1(name: "conv10_dw_s1")
-    addPointwise(name: "conv11_pw_s1")
-
-    addDepthwiseStride2(name: "conv12_dw_s2")
-    addPointwise2x(name: "conv13_pw_s1")
+    var x = input
+        --> Resize(width: resolution, height: resolution)
+        --> Custom(Preprocessing(device: device), channels: 3)
+        --> Convolution(kernel: (3, 3), channels: channels, stride: (2, 2), activation: relu, name: "conv1")
+        --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv2_1_dw")
+        --> PointwiseConvolution(channels: channels*2, activation: relu, name: "conv2_1_sep")
+        --> DepthwiseConvolution(kernel: (3, 3), stride: (2, 2), activation: relu, name: "conv2_2_dw")
+        --> PointwiseConvolution(channels: channels*4, activation: relu, name: "conv2_2_sep")
+        --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv3_1_dw")
+        --> PointwiseConvolution(channels: channels*4, activation: relu, name: "conv3_1_sep")
+        --> DepthwiseConvolution(kernel: (3, 3), stride: (2, 2), activation: relu, name: "conv3_2_dw")
+        --> PointwiseConvolution(channels: channels*8, activation: relu, name: "conv3_2_sep")
+        --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv4_1_dw")
+        --> PointwiseConvolution(channels: channels*8, activation: relu, name: "conv4_1_sep")
+        --> DepthwiseConvolution(kernel: (3, 3), stride: (2, 2), activation: relu, name: "conv4_2_dw")
+        --> PointwiseConvolution(channels: channels*16, activation: relu, name: "conv4_2_sep")
 
     if !shallow {
-      for i in 0..<5 {
-        addDepthwiseStride1(name: "conv\(14+i*2)_dw_s1")
-        addPointwise(name: "conv\(15+i*2)_pw_s1")
-      }
+      x = x --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv5_1_dw")
+            --> PointwiseConvolution(channels: channels*16, activation: relu, name: "conv5_1_sep")
+            --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv5_2_dw")
+            --> PointwiseConvolution(channels: channels*16, activation: relu, name: "conv5_2_sep")
+            --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv5_3_dw")
+            --> PointwiseConvolution(channels: channels*16, activation: relu, name: "conv5_3_sep")
+            --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv5_4_dw")
+            --> PointwiseConvolution(channels: channels*16, activation: relu, name: "conv5_4_sep")
+            --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv5_5_dw")
+            --> PointwiseConvolution(channels: channels*16, activation: relu, name: "conv5_5_sep")
     }
 
-    addDepthwiseStride2(name: "conv24_dw_s2")
-    addPointwise2x(name: "conv25_pw_s1")
+    x = x --> DepthwiseConvolution(kernel: (3, 3), stride: (2, 2), activation: relu, name: "conv5_6_dw")
+          --> PointwiseConvolution(channels: channels*32, activation: relu, name: "conv5_6_sep")
+          --> DepthwiseConvolution(kernel: (3, 3), activation: relu, name: "conv6_dw")
+          --> PointwiseConvolution(channels: channels*32, activation: relu, name: "conv6_sep")
+          --> GlobalAveragePooling()
+          --> Dense(neurons: classes, activation: nil, name: "fc7")
+          --> Softmax()
 
-    // NOTE: the paper says this is stride 2, but that does not
-    // correspond to the given input size for the next layer.
-    addDepthwiseStride1(name: "conv26_dw_s1")
-    addPointwise(name: "conv27_pw_s1")
+    model = Model(input: input, output: x)
 
-    let fcChannels = Int(1024 * alpha)
+    let success = model.compile(device: device, inflightBuffers: inflightBuffers) {
+      name, count, type in ParameterLoaderBundle(name: name,
+                                                 count: count,
+                                                 suffix: type == .weights ? "_w" : "_b",
+                                                 ext: "bin")
+    }
 
-    layers.append(averagePooling(device: device, kernel: (7, 7), stride: (7, 7)))
-    addImageDescriptor(MPSImageDescriptor(channelFormat: channelFormat,
-                                          width: 1,
-                                          height: 1,
-                                          featureChannels: fcChannels))
-    useImageDescriptor()
-
-    layers.append(dense(device: device, fanIn: fcChannels, fanOut: classes, filter: nil, name: "fc28"))
-    addImageDescriptor(outputImgDesc)
-    useImageDescriptor()
+    if success {
+      print(model.summary())
+    }
   }
 
   public func encode(commandBuffer: MTLCommandBuffer, texture inputTexture: MTLTexture, inflightIndex: Int) {
-    MPSTemporaryImage.prefetchStorage(with: commandBuffer, imageDescriptorList: imgDesc)
-
-    let scaledImage = MPSTemporaryImage(commandBuffer: commandBuffer, imageDescriptor: imgDesc[0])
-    lanczos.encode(commandBuffer: commandBuffer, sourceTexture: inputTexture, destinationTexture: scaledImage.texture)
-
-    var inputImage: MPSImage = scaledImage
-    for (i, layer) in layers.enumerated() {
-      let img = MPSTemporaryImage(commandBuffer: commandBuffer, imageDescriptor: imgDesc[layerImgDesc[i]])
-      if let layer = layer as? MPSCNNKernel {
-        layer.encode(commandBuffer: commandBuffer, sourceImage: inputImage, destinationImage: img)
-      } else if let layer = layer as? DepthwiseConvolutionKernel {
-        layer.encode(commandBuffer: commandBuffer, sourceImage: inputImage, destinationImage: img)
-      }
-      inputImage = img
-    }
-
-    softmax.encode(commandBuffer: commandBuffer, sourceImage: inputImage, destinationImage: outputImage[inflightIndex])
+    model.encode(commandBuffer: commandBuffer, texture: inputTexture, inflightIndex: inflightIndex)
   }
 
-  public func fetchResult(inflightIndex: Int) -> NeuralNetworkResult {
-    // Convert the MTLTexture from outputImage into something we can use
-    // from Swift and then find the class with the highest probability.
-    let probabilities = outputImage[inflightIndex].toFloatArray()
-    assert(probabilities.count == self.classes)
-    let (maxIndex, maxValue) = probabilities.argmax()
+  public func fetchResult(inflightIndex: Int) -> NeuralNetworkResult<Prediction> {
+    let probabilities = model.outputImage(inflightIndex: inflightIndex).toFloatArray()
+    assert(probabilities.count == (self.classes / 4) * 4)
 
-    var result = NeuralNetworkResult()
-    result.predictions.append((label: "\(maxIndex)", probability: maxValue))
+    var result = NeuralNetworkResult<Prediction>()
+    result.predictions = probabilities.top(k: 5).map { x -> Prediction in (x.0, x.1) }
     return result
   }
 }

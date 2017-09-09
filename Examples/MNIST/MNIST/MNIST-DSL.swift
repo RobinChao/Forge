@@ -30,26 +30,39 @@ import Forge
   Implements the LeNet-5 MNIST neural network using the DSL. This code is
   a lot shorter and easier to read!
 */
-public class MNIST: NeuralNetwork {
+class MNIST: NeuralNetwork {
+  typealias Prediction = (label: String, probability: Float)
+
   let model: Model
+  let resizeLayer: Resize
+  let grayscale: Tensor
 
-  public init(device: MTLDevice, inflightBuffers: Int) {
+  init(device: MTLDevice, inflightBuffers: Int) {
     let relu = MPSCNNNeuronReLU(device: device, a: 0)
-    let makeGrayscale = Preprocessing(device: device)
 
-    model = Model()
-            --> Input()        // this is optional thanks to Resize
-            --> Resize(width: 28, height: 28)
-            --> Custom(makeGrayscale, channels: 1, name: "Preprocessing")
-            --> Convolution(kernel: (5, 5), channels: 20, filter: relu, name: "conv1")
-            --> MaxPooling(kernel: (2, 2), stride: (2, 2))
-            --> Convolution(kernel: (5, 5), channels: 50, filter: relu, name: "conv2")
-            --> MaxPooling(kernel: (2, 2), stride: (2, 2))
-            --> Dense(neurons: 320, filter: relu, name: "fc1")
-            --> Dense(neurons: 10, name: "fc2")
-            --> Softmax()
+    let input = Input()
 
-    model["Preprocessing"]!.imageIsTemporary = false
+    // Keep a reference to this layer so we can crop the image on-the-fly.
+    resizeLayer = Resize(width: 28, height: 28)
+
+    grayscale = input
+            --> resizeLayer
+            --> Custom(Preprocessing(device: device), channels: 1)
+
+    // Make the output of the Preprocessing kernel a real MPSImage so we can
+    // show it on the screen (for debugging purposes).
+    grayscale.imageIsTemporary = false
+
+    let output = grayscale
+             --> Convolution(kernel: (5, 5), channels: 20, activation: relu, name: "conv1")
+             --> MaxPooling(kernel: (2, 2), stride: (2, 2))
+             --> Convolution(kernel: (5, 5), channels: 50, activation: relu, name: "conv2")
+             --> MaxPooling(kernel: (2, 2), stride: (2, 2))
+             --> Dense(neurons: 320, activation: relu, name: "fc1")
+             --> Dense(neurons: 10, name: "fc2")
+             --> Softmax()
+
+    model = Model(input: input, output: output)
 
     let success = model.compile(device: device, inflightBuffers: inflightBuffers) {
       name, count, type in ParameterLoaderBundle(name: name,
@@ -63,25 +76,32 @@ public class MNIST: NeuralNetwork {
     }
   }
 
-  public func encode(commandBuffer: MTLCommandBuffer, texture inputTexture: MTLTexture, inflightIndex: Int) {
+  func encode(commandBuffer: MTLCommandBuffer, texture inputTexture: MTLTexture, inflightIndex: Int) {
+    // This is how you can dynamically crop the input texture before resizing
+    // (this crops the input image to the center square).
+    resizeLayer.setCropRect(x: 0, y: 60, width: 360, height: 360)
+
     model.encode(commandBuffer: commandBuffer, texture: inputTexture, inflightIndex: inflightIndex)
   }
 
-  public func fetchResult(inflightIndex: Int) -> NeuralNetworkResult {
+  func fetchResult(inflightIndex: Int) -> NeuralNetworkResult<Prediction> {
     // Convert the MTLTexture from outputImage into something we can use
     // from Swift and then find the class with the highest probability.
+    let probabilities = model.outputImage(inflightIndex: inflightIndex).toFloatArray()
+
     // Note: there are only 10 classes but the number of channels in the 
     // output texture will always be a multiple of 4; in this case 12.
-    let probabilities = model.outputImage(inflightIndex: inflightIndex).toFloatArray()
     assert(probabilities.count == 12)
+
     let (maxIndex, maxValue) = probabilities.argmax()
 
-    var result = NeuralNetworkResult()
+    var result = NeuralNetworkResult<Prediction>()
     result.predictions.append((label: "\(maxIndex)", probability: maxValue))
 
     // Enable this to see the output of the preprocessing shader.
-    result.debugTexture = model.image(forLayer: "Preprocessing", inflightIndex: inflightIndex).texture
+    result.debugTexture = model.image(for: grayscale, inflightIndex: inflightIndex).texture
     result.debugScale = 1/255
+
     return result
   }
 }

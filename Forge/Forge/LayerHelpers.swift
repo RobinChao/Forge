@@ -26,7 +26,8 @@ import MetalKit
 import MetalPerformanceShaders
 
 /* 
-  Helper functions for creating the layers.
+  Helper functions for creating neural network layers. Not as awesome as using
+  the DSL but should save some work if you want to do things the hard way. ;-)
 
   The name of the layer is used to load its weights and bias values. You need
   to assign loader functions to weightsLoader and biasLoader.
@@ -46,31 +47,39 @@ public func convolution(device: MTLDevice,
                         kernel: (Int, Int),
                         inChannels: Int,
                         outChannels: Int,
-                        filter: MPSCNNNeuron,
+                        activation: MPSCNNNeuron?,
                         name: String,
                         stride: (Int, Int) = (1, 1),
+                        useBias: Bool = true,
                         mergeOffset: Int = 0) -> MPSCNNConvolution {
 
   let countWeights = inChannels * kernel.1 * kernel.0 * outChannels
   let countBias = outChannels
 
-  guard let weightsData = weightsLoader?(name, countWeights),
-        let biasData = biasLoader?(name, countBias) else {
-    fatalError("Error loading network parameters '\(name)'")
+  guard let weightsData = weightsLoader?(name, countWeights) else {
+    fatalError("Error loading weights '\(name)'")
+  }
+
+  var biasData: ParameterData?
+  if useBias {
+    biasData = biasLoader?(name, countBias)
+    if biasData == nil {
+      fatalError("Error loading bias terms '\(name)'")
+    }
   }
 
   let desc = MPSCNNConvolutionDescriptor(kernelWidth: kernel.0,
                                          kernelHeight: kernel.1,
                                          inputFeatureChannels: inChannels,
                                          outputFeatureChannels: outChannels,
-                                         neuronFilter: filter)
+                                         neuronFilter: activation)
   desc.strideInPixelsX = stride.0
   desc.strideInPixelsY = stride.1
 
   let layer = MPSCNNConvolution(device: device,
                                 convolutionDescriptor: desc,
                                 kernelWeights: weightsData.pointer,
-                                biasTerms: biasData.pointer,
+                                biasTerms: biasData?.pointer,
                                 flags: .none)
   layer.edgeMode = .zero
   layer.destinationFeatureChannelOffset = mergeOffset
@@ -127,16 +136,24 @@ public func dense(device: MTLDevice,
                   shape: (Int, Int),
                   inChannels: Int,
                   fanOut: Int,
-                  filter: MPSCNNNeuron?,
+                  activation: MPSCNNNeuron?,
                   name: String,
+                  useBias: Bool = true,
                   mergeOffset: Int = 0) -> MPSCNNFullyConnected {
 
   let countWeights = inChannels * shape.0 * shape.1 * fanOut
   let countBias = fanOut
 
-  guard let weightsData = weightsLoader?(name, countWeights),
-        let biasData = biasLoader?(name, countBias) else {
-    fatalError("Error loading network parameters '\(name)'")
+  guard let weightsData = weightsLoader?(name, countWeights) else {
+    fatalError("Error loading weights '\(name)'")
+  }
+
+  var biasData: ParameterData?
+  if useBias {
+    biasData = biasLoader?(name, countBias)
+    if biasData == nil {
+      fatalError("Error loading bias terms '\(name)'")
+    }
   }
 
   // A fully-connected layer is a special version of a convolutional layer
@@ -146,12 +163,12 @@ public func dense(device: MTLDevice,
                                          kernelHeight: shape.1,
                                          inputFeatureChannels: inChannels,
                                          outputFeatureChannels: fanOut,
-                                         neuronFilter: filter)
+                                         neuronFilter: activation)
 
   let layer = MPSCNNFullyConnected(device: device,
                                    convolutionDescriptor: desc,
                                    kernelWeights: weightsData.pointer,
-                                   biasTerms: biasData.pointer,
+                                   biasTerms: biasData?.pointer,
                                    flags: .none)
 
   layer.destinationFeatureChannelOffset = mergeOffset
@@ -169,15 +186,11 @@ public func dense(device: MTLDevice,
 public func dense(device: MTLDevice,
                   fanIn: Int,
                   fanOut: Int,
-                  filter: MPSCNNNeuron?,
+                  activation: MPSCNNNeuron?,
                   name: String) -> MPSCNNFullyConnected {
 
-  return dense(device: device, shape: (1, 1), inChannels: fanIn, fanOut: fanOut, filter: filter, name: name)
-}
-
-public enum PaddingType {
-  case same    // add zero padding
-  case valid   // don't add padding
+  return dense(device: device, shape: (1, 1), inChannels: fanIn,
+               fanOut: fanOut, activation: activation, name: name)
 }
 
 extension MPSCNNConvolution {
@@ -191,13 +204,33 @@ extension MPSCNNConvolution {
       of `(0, 0, 0)` for `self.offset` is sufficient. 
   */
   @nonobjc public func applyPadding(type: PaddingType, sourceImage: MPSImage, destinationImage: MPSImage) {
-    if type == .same {
-      let padH = (destinationImage.height - 1) * self.strideInPixelsY + self.kernelHeight - sourceImage.height
-      let padW = (destinationImage.width  - 1) * self.strideInPixelsX + self.kernelWidth  - sourceImage.width
-      self.offset = MPSOffset(x: (self.kernelWidth - padW)/2, y: (self.kernelHeight - padH)/2, z: 0)
-    } else {
-      self.offset = MPSOffset(x: self.kernelWidth/2, y: self.kernelHeight/2, z: 0)
-    }
+    self.offset = offsetForConvolution(padding: type,
+                                       sourceWidth: sourceImage.width,
+                                       sourceHeight: sourceImage.height,
+                                       destinationWidth: destinationImage.width,
+                                       destinationHeight: destinationImage.height,
+                                       kernelWidth: self.kernelWidth,
+                                       kernelHeight: self.kernelHeight,
+                                       strideInPixelsX: self.strideInPixelsX,
+                                       strideInPixelsY: self.strideInPixelsY)
+
+  }
+}
+
+extension MPSCNNPooling {
+  /**
+    Computes the padding for a pooling layer. You need to call this just
+    before `poolLayer.encode(...)` because it changes the layer's `offset`
+    property.
+  */
+  @nonobjc public func applyPadding(type: PaddingType, sourceImage: MPSImage, destinationImage: MPSImage) {
+    self.offset = offsetForPooling(padding: type,
+                                   sourceWidth: sourceImage.width,
+                                   sourceHeight: sourceImage.height,
+                                   kernelWidth: self.kernelWidth,
+                                   kernelHeight: self.kernelHeight,
+                                   strideInPixelsX: self.strideInPixelsX,
+                                   strideInPixelsY: self.strideInPixelsY)
   }
 }
 
@@ -211,13 +244,24 @@ extension MPSCNNConvolution {
 public func depthwiseConvolution(device: MTLDevice,
                  kernel: (Int, Int),
                  channels: Int,
+                 activation: MPSCNNNeuron?,
                  name: String,
-                 stride: (Int, Int) = (1, 1)) -> DepthwiseConvolutionKernel {
+                 stride: (Int, Int) = (1, 1),
+                 useBias: Bool) -> DepthwiseConvolutionKernel {
 
   let countWeights = channels * kernel.1 * kernel.0
+  let countBias = channels
 
   guard let weightsData = weightsLoader?(name, countWeights) else {
-    fatalError("Error loading network parameters '\(name)'")
+    fatalError("Error loading weights '\(name)'")
+  }
+
+  var biasData: ParameterData?
+  if useBias {
+    biasData = biasLoader?(name, countBias)
+    if biasData == nil {
+      fatalError("Error loading bias terms '\(name)'")
+    }
   }
 
   return DepthwiseConvolutionKernel(device: device,
@@ -226,7 +270,9 @@ public func depthwiseConvolution(device: MTLDevice,
                                     featureChannels: channels,
                                     strideInPixelsX: stride.0,
                                     strideInPixelsY: stride.1,
-                                    kernelWeights: weightsData.pointer)
+                                    neuronFilter: activation,
+                                    kernelWeights: weightsData.pointer,
+                                    biasTerms: biasData?.pointer)
 }
 
 /**
@@ -235,7 +281,7 @@ public func depthwiseConvolution(device: MTLDevice,
 public func pointwiseConvolution(device: MTLDevice,
                                  inChannels: Int,
                                  outChannels: Int,
-                                 filter: MPSCNNNeuron,
+                                 activation: MPSCNNNeuron?,
                                  name: String,
                                  stride: (Int, Int) = (1, 1),
                                  mergeOffset: Int = 0) -> MPSCNNConvolution {
@@ -244,6 +290,6 @@ public func pointwiseConvolution(device: MTLDevice,
                      kernel: (1, 1),
                      inChannels: inChannels,
                      outChannels: outChannels,
-                     filter: filter,
+                     activation: activation,
                      name: name)
 }

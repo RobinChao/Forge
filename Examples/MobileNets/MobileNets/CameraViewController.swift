@@ -39,7 +39,6 @@ class CameraViewController: UIViewController {
 
   @IBOutlet weak var videoPreview: UIView!
   @IBOutlet weak var predictionLabel: UILabel!
-  @IBOutlet weak var extraLabel: UILabel!
   @IBOutlet weak var timeLabel: UILabel!
   @IBOutlet weak var debugImageView: UIImageView!
 
@@ -47,15 +46,17 @@ class CameraViewController: UIViewController {
   var device: MTLDevice!
   var commandQueue: MTLCommandQueue!
   var runner: Runner!
-  var network: NeuralNetwork!
+  var network: MobileNet!
+
+  let labels = ImageNetLabels()
 
   var startupGroup = DispatchGroup()
+  let fpsCounter = FPSCounter()
 
   override func viewDidLoad() {
     super.viewDidLoad()
 
     predictionLabel.text = ""
-    extraLabel.text = ""
     timeLabel.text = ""
 
     device = MTLCreateSystemDefaultDevice()
@@ -70,7 +71,6 @@ class CameraViewController: UIViewController {
 
     videoCapture = VideoCapture(device: device)
     videoCapture.delegate = self
-    videoCapture.fps = 15
 
     // Initialize the camera.
     startupGroup.enter()
@@ -93,6 +93,7 @@ class CameraViewController: UIViewController {
     startupGroup.notify(queue: .main) {
       // NOTE: At this point you'd remove the spinner and enable the UI.
 
+      self.fpsCounter.start()
       self.videoCapture.start()
     }
   }
@@ -122,7 +123,7 @@ class CameraViewController: UIViewController {
   func createNeuralNetwork(completion: @escaping () -> Void) {
     // Make sure the current device supports MetalPerformanceShaders.
     guard MPSSupportsMTLDevice(device) else {
-      print("Error: Metal Performance Shaders not supported on this device")
+      print("Error: this device does not support Metal Performance Shaders")
       return
     }
 
@@ -133,7 +134,11 @@ class CameraViewController: UIViewController {
     DispatchQueue.global().async {
 
       timeIt("Setting up neural network") {
-        self.network = MobileNet(device: self.device, inflightBuffers: MaxBuffersInFlight)
+        self.network = MobileNet(device: self.device,
+                                 widthMultiplier: 1,
+                                 resolutionMultiplier: 1,
+                                 shallow: false,
+                                 inflightBuffers: MaxBuffersInFlight)
       }
       DispatchQueue.main.async(execute: completion)
     }
@@ -152,26 +157,25 @@ class CameraViewController: UIViewController {
       if let texture = result.debugTexture {
         self.debugImageView.image = UIImage.image(texture: texture, scale: result.debugScale, offset: result.debugOffset)
       }
-      self.timeLabel.text = String(format: "Elapsed %.5f seconds (%.2f FPS)", result.elapsed, 1/result.elapsed)
+
+      self.fpsCounter.frameCompleted()
+      self.timeLabel.text = String(format: "%.1f FPS (latency: %.5f sec)", self.fpsCounter.fps, result.latency)
     }
   }
 
-  private func show(predictions: [Prediction]) {
-    let p = predictions[0]
-    if p.probability > 0.9 {
-      predictionLabel.text = p.label
-      extraLabel.text = String(format: "%2.1f%%", p.probability * 100)
-    } else {
-      predictionLabel.text = "???"
-      extraLabel.text = String(format: "%@ (%2.1f%%)", p.label, p.probability * 100)
+  private func show(predictions: [MobileNet.Prediction]) {
+    var s: [String] = []
+    for (i, pred) in predictions.enumerated() {
+      s.append(String(format: "%d: %@ (%3.2f%%)", i + 1, labels[pred.labelIndex], pred.probability * 100))
     }
+    predictionLabel.text = s.joined(separator: "\n\n")
   }
 }
 
 extension CameraViewController: VideoCaptureDelegate {
   func videoCapture(_ capture: VideoCapture, didCaptureVideoTexture texture: MTLTexture?, timestamp: CMTime) {
     // To test with a fixed image (useful for debugging), do this:
-    //predict(texture: loadTexture(named: "three.png")!)
+    //predict(texture: loadTexture(named: "cat224x224.png")!); return
 
     // Call the predict() method, which encodes the neural net's GPU commands,
     // on our own thread. Since NeuralNetwork.predict() can block, so can our

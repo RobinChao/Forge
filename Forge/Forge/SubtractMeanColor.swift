@@ -32,6 +32,7 @@ import MetalPerformanceShaders
 public class SubtractMeanColor {
   let device: MTLDevice
   let pipeline: MTLComputePipelineState
+  let params: [Float16]
 
   /**
     Creates a new SubtractMeanColor kernel for the specified colors.
@@ -45,23 +46,23 @@ public class SubtractMeanColor {
               blue: Float = 103.939, scale: Float = 255) {
     self.device = device
 
-    var float32 = [red, green, blue, 0, scale]
-    var float16 = float32to16(&float32, count: float32.count)
+    var float32 = [red, green, blue, 0, scale, scale, scale, 1]
+    params = float32to16(&float32, count: float32.count)
 
-    let values = MTLFunctionConstantValues()
-    values.setConstantValue(&float16, type: .half4, at: 0)
-    values.setConstantValue(&float16 + 4, type: .half, at: 1)
-
-    pipeline = makeFunction(device: device, name: "subtractMeanColor", constantValues: values, useForgeLibrary: true)
+    pipeline = makeFunction(device: device, name: "subtractMeanColor", useForgeLibrary: true)
   }
 
-  public func encode(commandBuffer: MTLCommandBuffer, sourceImage: MPSImage, destinationImage: MPSImage) {
-    let encoder = commandBuffer.makeComputeCommandEncoder()
-    encoder.setComputePipelineState(pipeline)
-    encoder.setTexture(sourceImage.texture, at: 0)
-    encoder.setTexture(destinationImage.texture, at: 1)
-    encoder.dispatch(pipeline: pipeline, image: destinationImage)
-    encoder.endEncoding()
+  public func encode(commandBuffer: MTLCommandBuffer,
+                     sourceImage: MPSImage, destinationImage: MPSImage) {
+
+    if let encoder = commandBuffer.makeComputeCommandEncoder() {
+      encoder.setComputePipelineState(pipeline)
+      encoder.setTexture(sourceImage.texture, index: 0)
+      encoder.setTexture(destinationImage.texture, index: 1)
+      encoder.setBytes(params, length: params.count * MemoryLayout<Float16>.stride, index: 0)
+      encoder.dispatch(pipeline: pipeline, image: destinationImage)
+      encoder.endEncoding()
+    }
 
     if let image = sourceImage as? MPSTemporaryImage {
       image.readCount -= 1

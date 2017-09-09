@@ -40,9 +40,10 @@ class CameraViewController: UIViewController {
   var device: MTLDevice!
   var commandQueue: MTLCommandQueue!
   var runner: Runner!
-  var network: NeuralNetwork!
+  var network: MNIST!
 
   var startupGroup = DispatchGroup()
+  let fpsCounter = FPSCounter()
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -63,7 +64,6 @@ class CameraViewController: UIViewController {
 
     videoCapture = VideoCapture(device: device)
     videoCapture.delegate = self
-    videoCapture.fps = 15
 
     // Initialize the camera.
     startupGroup.enter()
@@ -86,6 +86,7 @@ class CameraViewController: UIViewController {
     startupGroup.notify(queue: .main) {
       // NOTE: At this point you'd remove the spinner and enable the UI.
 
+      self.fpsCounter.start()
       self.videoCapture.start()
     }
   }
@@ -115,7 +116,7 @@ class CameraViewController: UIViewController {
   func createNeuralNetwork(completion: @escaping () -> Void) {
     // Make sure the current device supports MetalPerformanceShaders.
     guard MPSSupportsMTLDevice(device) else {
-      print("Error: Metal Performance Shaders not supported on this device")
+      print("Error: this device does not support Metal Performance Shaders")
       return
     }
 
@@ -145,11 +146,13 @@ class CameraViewController: UIViewController {
       if let texture = result.debugTexture {
         self.debugImageView.image = UIImage.image(texture: texture, scale: result.debugScale, offset: result.debugOffset)
       }
-      self.timeLabel.text = String(format: "Elapsed %.5f seconds (%.2f FPS)", result.elapsed, 1/result.elapsed)
+
+      self.fpsCounter.frameCompleted()
+      self.timeLabel.text = String(format: "%.1f FPS (latency: %.5f sec)", self.fpsCounter.fps, result.latency)
     }
   }
 
-  private func show(predictions: [Prediction]) {
+  private func show(predictions: [MNIST.Prediction]) {
     let p = predictions[0]
     if p.probability > 0.9 {
       predictionLabel.text = p.label

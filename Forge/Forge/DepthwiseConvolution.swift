@@ -33,11 +33,13 @@ import Accelerate
 
   A depth-wise convolution only performs filtering; it doesn't combine channels
   to create new features like a regular convolution does.
+
+  - Note: On iOS 11 and up, use MPSCNNDepthWiseConvolutionDescriptor instead.
 */
-public class DepthwiseConvolutionKernel {
-  let device: MTLDevice
+public class DepthwiseConvolutionKernel: ForgeKernel {
   let pipeline: MTLComputePipelineState
   let weightsBuffer: MTLBuffer
+  let biasBuffer: MTLBuffer
 
   /**
     Creates a new DepthwiseConvolution object.
@@ -48,8 +50,8 @@ public class DepthwiseConvolutionKernel {
         Default is 1.
       - relu: If true, applies a ReLU to the output. Default is false.
       - kernelWeights: The weights should be arranged in memory like this:
-        `[kernelHeight][kernelWidth][featureChannels]`. There is no bias for
-        this kind of layer.
+        `[featureChannels][kernelHeight][kernelWidth]`.
+      - biasTerms: One bias term per channel (optional).
   */
   public init(device: MTLDevice,
               kernelWidth: Int,
@@ -58,52 +60,63 @@ public class DepthwiseConvolutionKernel {
               strideInPixelsX: Int = 1,
               strideInPixelsY: Int = 1,
               channelMultiplier: Int = 1,
-              relu: Bool = false,
-              kernelWeights: UnsafePointer<Float>) {
+              neuronFilter: MPSCNNNeuron?,
+              kernelWeights: UnsafePointer<Float>,
+              biasTerms: UnsafePointer<Float>?) {
 
     precondition(kernelWidth == 3 && kernelHeight == 3, "Only 3x3 kernels are currently supported")
     precondition(channelMultiplier == 1, "Channel multipliers are not supported yet")
 
-    self.device = device
+    let outputSlices = (featureChannels + 3) / 4
+    let paddedOutputChannels = outputSlices * 4
+    let count = paddedOutputChannels * kernelHeight * kernelWidth
+    weightsBuffer = device.makeBuffer(length: MemoryLayout<Float16>.stride * count)!
 
-    // Convert the weights to 16-bit floats and copy them into a Metal buffer.
-    let slices = (featureChannels + 3) / 4
-    let count = kernelHeight * kernelWidth * slices * 4
-    weightsBuffer = device.makeBuffer(length: MemoryLayout<Float16>.stride * count)
-    weightsToBufferFloat16(weights: kernelWeights,
-                           buffer: weightsBuffer,
-                           featureChannels: featureChannels,
-                           count: count)
+    let ptr = UnsafeMutablePointer(mutating: kernelWeights)
+    let copyCount = featureChannels * kernelHeight * kernelWidth
+    float32to16(input: ptr, output: weightsBuffer.contents(), count: copyCount)
 
-    // Specialize the compute function, so that the Metal compiler will build
-    // a unique kernel based on the chosen options for stride, etc. We could
-    // pass these options into the kernel using a buffer instead, but then we
-    // would have to branch at runtime, which is slower.
+    biasBuffer = makeBuffer(device: device,
+                            channelFormat: .float16,
+                            outputFeatureChannels: featureChannels,
+                            biasTerms: biasTerms)
+
+    var params = KernelParams()
+    let constants = MTLFunctionConstantValues()
+    configureNeuronType(filter: neuronFilter, constants: constants, params: &params)
+
     var stride = [ UInt16(strideInPixelsX), UInt16(strideInPixelsY) ]
-    var useReLU = relu
-    let values = MTLFunctionConstantValues()
-    values.setConstantValue(&stride, type: .ushort2, at: 2)
-    values.setConstantValue(&useReLU, type: .bool, at: 3)
+    constants.setConstantValue(&stride, type: .ushort2, withName: "stride")
 
-    // If there's more than one texture slice in the image, we have to use a
-    // kernel that uses texture2d_array objects.
     let functionName: String
-    if slices == 1 {
-      functionName = "depthwiseConv3x3_half"
+    if featureChannels <= 4 {
+      functionName = "depthwiseConv3x3"
     } else {
-      functionName = "depthwiseConv3x3_half_array"
+      functionName = "depthwiseConv3x3_array"
     }
-    pipeline = makeFunction(device: device, name: functionName, constantValues: values, useForgeLibrary: true)
+    pipeline = makeFunction(device: device, name: functionName,
+                            constantValues: constants, useForgeLibrary: true)
+
+    super.init(device: device, neuron: neuronFilter, params: params)
   }
 
-  public func encode(commandBuffer: MTLCommandBuffer, sourceImage: MPSImage, destinationImage: MPSImage) {
-    let encoder = commandBuffer.makeComputeCommandEncoder()
-    encoder.setComputePipelineState(pipeline)
-    encoder.setTexture(sourceImage.texture, at: 0)
-    encoder.setTexture(destinationImage.texture, at: 1)
-    encoder.setBuffer(weightsBuffer, offset: 0, at: 0)
-    encoder.dispatch(pipeline: pipeline, image: destinationImage)
-    encoder.endEncoding()
+  public override func encode(commandBuffer: MTLCommandBuffer,
+                              sourceImage: MPSImage, destinationImage: MPSImage) {
+    // TODO: set the KernelParams based on clipRect, destinationFeatureChannelOffset, edgeMode
+    params.inputOffsetX = Int16(offset.x);
+    params.inputOffsetY = Int16(offset.y);
+    params.inputOffsetZ = Int16(offset.z);
+
+    if let encoder = commandBuffer.makeComputeCommandEncoder() {
+      encoder.setComputePipelineState(pipeline)
+      encoder.setTexture(sourceImage.texture, index: 0)
+      encoder.setTexture(destinationImage.texture, index: 1)
+      encoder.setBytes(&params, length: MemoryLayout<KernelParams>.size, index: 0)
+      encoder.setBuffer(weightsBuffer, offset: 0, index: 1)
+      encoder.setBuffer(biasBuffer, offset: 0, index: 2)
+      encoder.dispatch(pipeline: pipeline, image: destinationImage)
+      encoder.endEncoding()
+    }
 
     if let image = sourceImage as? MPSTemporaryImage {
       image.readCount -= 1

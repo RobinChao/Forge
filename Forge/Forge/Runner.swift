@@ -30,12 +30,15 @@ import MetalPerformanceShaders
   
   For optimal throughput we don't want the CPU to wait for the GPU, or vice
   versa. This means the GPU can be working on several inputs at once. Runner
-  takes care of the synchronization for you. However, the NeuralNetwork must
-  allocate multiple output images so that each independent GPU pass gets its
-  own MPSImage. (You need to do this for all MPSImages stored by the neural
-  network, but not for MPSTemporaryImages.)
+  takes care of the synchronization for you.
+  
+  However, the NeuralNetwork must allocate multiple output images so that each 
+  independent GPU pass gets its own MPSImage. (You need to do this for all 
+  MPSImages stored by the neural network, but not for MPSTemporaryImages.)
 */
 public protocol NeuralNetwork {
+  associatedtype PredictionType
+
   /**
     Encodes the commands for the GPU.
 
@@ -49,28 +52,30 @@ public protocol NeuralNetwork {
     Converts the output MPSImage into an array of predictions.
     This is called from a background thread.
   */
-  func fetchResult(inflightIndex: Int) -> NeuralNetworkResult
+  func fetchResult(inflightIndex: Int) -> NeuralNetworkResult<PredictionType>
 }
-
-public typealias Prediction = (label: String, probability: Float)
 
 /**
   This object is passed back to the UI thread after the neural network has
   made a new prediction.
 */
-public struct NeuralNetworkResult {
-  public var predictions: [Prediction] = []
+public struct NeuralNetworkResult<PredictionType> {
+  public var predictions: [PredictionType] = []
 
   // For debugging purposes it can be useful to look at the output from
   // intermediate layers. To do so, make the layer write to a real MPSImage
-  // object (not MPSTemporaryImage), and fill in the debugTexture property.
+  // object (not MPSTemporaryImage) and fill in the debugTexture property.
   // The UI thread can then display this texture as a UIImage.
   public var debugTexture: MTLTexture?
   public var debugScale: Float = 1       // for scaling down float images
   public var debugOffset: Float = 0      // for images with negative values
 
-  // This is filled in by Runner to measure the effective framerate.
-  public var elapsed: CFTimeInterval = 0
+  // This is filled in by Runner to measure the latency between starting a
+  // prediction and receiving the answer. (NOTE: Because we can start a new
+  // prediction while the previous one is still being processed, the latency
+  // actually becomes larger the more inflight buffers you're using. It is
+  // therefore *not* a good indicator of throughput, i.e. frames per second.)
+  public var latency: CFTimeInterval = 0
 
   public init() { }
 }
@@ -81,8 +86,8 @@ public struct NeuralNetworkResult {
   free to just do neural network stuff.
 */
 public class Runner {
-  let device: MTLDevice
-  let commandQueue: MTLCommandQueue
+  public let device: MTLDevice
+  public let commandQueue: MTLCommandQueue
 
   let inflightSemaphore: DispatchSemaphore
   let inflightBuffers: Int
@@ -112,10 +117,11 @@ public class Runner {
       again! You should call it from a background thread -- it's OK to use the
       VideoCapture queue for this.
   */
-  public func predict(network: NeuralNetwork,
+  public func predict<NeuralNetworkType: NeuralNetwork>(
+                      network: NeuralNetworkType,
                       texture inputTexture: MTLTexture,
                       queue: DispatchQueue,
-                      completion: @escaping (NeuralNetworkResult) -> Void) {
+                      completion: @escaping (NeuralNetworkResult<NeuralNetworkType.PredictionType>) -> Void) {
 
     // Block until the next GPU buffer is available.
     inflightSemaphore.wait()
@@ -125,7 +131,7 @@ public class Runner {
     //commandQueue.insertDebugCaptureBoundary()
 
     autoreleasepool {
-      let commandBuffer = commandQueue.makeCommandBuffer()
+      guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
       network.encode(commandBuffer: commandBuffer, texture: inputTexture, inflightIndex: inflightIndex)
 
@@ -135,7 +141,7 @@ public class Runner {
       commandBuffer.addCompletedHandler { [inflightIndex] commandBuffer in
 
         var result = network.fetchResult(inflightIndex: inflightIndex)
-        result.elapsed = CACurrentMediaTime() - startTime
+        result.latency = CACurrentMediaTime() - startTime
 
         //print("GPU execution duration:", commandBuffer.gpuEndTime - commandBuffer.gpuStartTime)
         //print("Elapsed time: \(endTime - startTime) sec")

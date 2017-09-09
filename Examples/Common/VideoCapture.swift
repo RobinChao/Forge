@@ -37,7 +37,7 @@ public class VideoCapture: NSObject {
 
   public var previewLayer: AVCaptureVideoPreviewLayer?
   public weak var delegate: VideoCaptureDelegate?
-  public var fps = 15
+  public var fps = -1
 
   let device: MTLDevice
   var textureCache: CVMetalTextureCache?
@@ -53,25 +53,26 @@ public class VideoCapture: NSObject {
     super.init()
   }
 
-  public func setUp(completion: @escaping (Bool) -> Void) {
+  public func setUp(sessionPreset: AVCaptureSession.Preset = .medium,
+                    completion: @escaping (Bool) -> Void) {
     queue.async {
-      let success = self.setUpCamera()
+      let success = self.setUpCamera(sessionPreset: sessionPreset)
       DispatchQueue.main.async {
         completion(success)
       }
     }
   }
 
-  func setUpCamera() -> Bool {
+  func setUpCamera(sessionPreset: AVCaptureSession.Preset) -> Bool {
     guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache) == kCVReturnSuccess else {
       print("Error: could not create a texture cache")
       return false
     }
 
     captureSession.beginConfiguration()
-    captureSession.sessionPreset = AVCaptureSessionPresetMedium
+    captureSession.sessionPreset = sessionPreset
 
-    guard let captureDevice = AVCaptureDevice.defaultDevice(withMediaType: AVMediaTypeVideo) else {
+    guard let captureDevice = AVCaptureDevice.default(for: AVMediaType.video) else {
       print("Error: no video devices available")
       return false
     }
@@ -85,11 +86,10 @@ public class VideoCapture: NSObject {
       captureSession.addInput(videoInput)
     }
 
-    if let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession) {
-      previewLayer.videoGravity = AVLayerVideoGravityResizeAspect
-      previewLayer.connection?.videoOrientation = .portrait
-      self.previewLayer = previewLayer
-    }
+    let previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+    previewLayer.videoGravity = AVLayerVideoGravity.resizeAspect
+    previewLayer.connection?.videoOrientation = .portrait
+    self.previewLayer = previewLayer
 
     let settings: [String : Any] = [
       kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA)
@@ -104,7 +104,7 @@ public class VideoCapture: NSObject {
 
     // We want the buffers to be in portrait orientation otherwise they are
     // rotated by 90 degrees. Need to set this _after_ addOutput()!
-    videoOutput.connection(withMediaType: AVMediaTypeVideo).videoOrientation = .portrait
+    videoOutput.connection(with: AVMediaType.video)?.videoOrientation = .portrait
 
     if captureSession.canAddOutput(photoOutput) {
       captureSession.addOutput(photoOutput)
@@ -133,7 +133,7 @@ public class VideoCapture: NSObject {
     ])
 
     settings.previewPhotoFormat = [
-      kCVPixelBufferPixelFormatTypeKey as String: settings.availablePreviewPhotoPixelFormatTypes[0],
+      kCVPixelBufferPixelFormatTypeKey as String: settings.__availablePreviewPhotoPixelFormatTypes[0],
       kCVPixelBufferWidthKey as String: 480,
       kCVPixelBufferHeightKey as String: 360,
     ]
@@ -179,30 +179,33 @@ public class VideoCapture: NSObject {
 }
 
 extension VideoCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
-  public func captureOutput(_ captureOutput: AVCaptureOutput!, didOutputSampleBuffer sampleBuffer: CMSampleBuffer!, from connection: AVCaptureConnection!) {
-
+  public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     // Because lowering the capture device's FPS looks ugly in the preview,
     // we capture at full speed but only call the delegate at its desired
-    // framerate.
+    // framerate. If `fps` is -1, we run at the full framerate.
 
     let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     let deltaTime = timestamp - lastTimestamp
-    if deltaTime >= CMTimeMake(1, Int32(fps)) {
+    if fps == -1 || deltaTime >= CMTimeMake(1, Int32(fps)) {
       lastTimestamp = timestamp
 
       let texture = convertToMTLTexture(sampleBuffer: sampleBuffer)
       delegate?.videoCapture(self, didCaptureVideoTexture: texture, timestamp: timestamp)
     }
   }
+
+  public func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    print("dropped frame")
+  }
 }
 
 extension VideoCapture: AVCapturePhotoCaptureDelegate {
-  public func capture(_ captureOutput: AVCapturePhotoOutput,
-                      didFinishProcessingPhotoSampleBuffer photoSampleBuffer: CMSampleBuffer?,
-                      previewPhotoSampleBuffer: CMSampleBuffer?,
-                      resolvedSettings: AVCaptureResolvedPhotoSettings,
-                      bracketSettings: AVCaptureBracketedStillImageSettings?,
-                      error: Error?) {
+  public func photoOutput(_ captureOutput: AVCapturePhotoOutput,
+                          didFinishProcessingPhoto photoSampleBuffer: CMSampleBuffer?,
+                          previewPhoto previewPhotoSampleBuffer: CMSampleBuffer?,
+                          resolvedSettings: AVCaptureResolvedPhotoSettings,
+                          bracketSettings: AVCaptureBracketedStillImageSettings?,
+                          error: Error?) {
 
     var imageTexture: MTLTexture?
     var previewImage: UIImage?
